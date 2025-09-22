@@ -7,6 +7,7 @@ import { Send, Users, MessageCircle, UserPlus, Check, X } from "lucide-react";
 function App() {
   const [userId, setUserId] = useState("");
   const [socket, setSocket] = useState(null);
+  const [inputValue, setInputValue] = useState("");
 
   // Mock socket connection for demo
   useEffect(() => {
@@ -32,14 +33,18 @@ function App() {
             <input
               type="text"
               placeholder="Enter your username"
-              value={userId}
-              onChange={(e) => setUserId(e.target.value)}
+              value={inputValue}
+              onChange={(e) => setInputValue(e.target.value)}
               className="w-full px-4 py-3 border border-slate-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-transparent outline-none transition-all text-center"
-              onKeyPress={e => e.key === 'Enter' && userId && setUserId(userId)}
+              onKeyDown={(e) => {
+                if (e.key === "Enter" && inputValue.trim()) {
+                  setUserId(inputValue.trim()); // set main state on Enter
+                }
+              }}
             />
             <button
-              onClick={() => userId && setUserId(userId)}
-              disabled={!userId}
+              onClick={() => inputValue && setUserId(inputValue.trim())}
+              disabled={!inputValue}
               className="w-full bg-blue-600 hover:bg-blue-700 disabled:bg-slate-300 text-white font-medium py-3 px-4 rounded-lg transition-colors"
             >
               Join SecureChat

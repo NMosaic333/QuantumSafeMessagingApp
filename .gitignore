@@ -1,0 +1,51 @@
+# --- Logs ---
+logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+lerna-debug.log*
+
+# --- Node / React frontend ---
+node_modules
+dist
+dist-ssr
+*.local
+
+# --- Python backend ---
+__pycache__/
+app/__pycache__/
+backend/__pycache__/
+backend/app/__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+*.egg-info/
+.eggs/
+*.sqlite3
+
+# Virtual environments
+.env/
+.venv/
+venv/
+ENV/
+env.bak/
+venv.bak/
+# Ignore Python virtual environment
+backend/app/venv/
+
+# --- Environment & secrets ---
+.env
+
+# --- Editor directories and files ---
+.vscode/*
+!.vscode/extensions.json
+.idea
+.DS_Store
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?

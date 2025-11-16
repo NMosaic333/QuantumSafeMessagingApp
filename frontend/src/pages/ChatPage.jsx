@@ -1,6 +1,8 @@
-import React, { useState, useEffect } from "react";
+import React, { useRef,useState, useEffect } from "react";
 import { MessageCircle, UserPlus, Users, Send, Check, X } from "lucide-react";
 import { useCrypto } from "../utilities/cryptomanager";
+import { db } from "../utilities/db";
+import { falcon } from "falcon-crypto";
 
 export default function ChatPage({ socket, userId }) {
   const crypto = useCrypto();
@@ -10,19 +12,45 @@ export default function ChatPage({ socket, userId }) {
   const [messages, setMessages] = useState({});
   const [input, setInput] = useState("");
   const previousChats = Object.keys(messages).filter(userId => messages[userId].length > 0);
+  const chatRef = useRef(null);
+  const messagesEndRef = useRef(null);
+  const [onlineStatus, setOnlineStatus] = useState({}); // userId -> boolean
+  const [falconPeerKey, setFalconPeerKey] = useState([]);
 
   /** 🔑 Generate keys & publish to backend */
   useEffect(() => {
     async function initKeys() {
       try {
-        await crypto.generateKeys();
-        const { kyberPk, falconPk } = crypto.getMyPublicKey();
-        console.log("✅ Generated Kyber and Falcon key pair");
+        const res = await db.identity.get(userId);
+        if (res) {
+          console.log("✅ Identity keys already exist locally");
+          await crypto.loadKeys(userId);
+          const restored = await crypto.loadPeerMessages(userId);
+          if (restored) {
+            setMessages(restored); // ✅ Put persisted chats into state
+          }
+          return;
+        }
 
+        await crypto.generateKeys(userId);
+        const { kyberPk, falconPk } = crypto.getMyPublicKey();
+
+        function uint8ToBase64(uint8Arr) {
+          let binary = "";
+          const chunkSize = 0x8000; // 32KB chunks
+          for (let i = 0; i < uint8Arr.length; i += chunkSize) {
+            const chunk = uint8Arr.subarray(i, i + chunkSize);
+            binary += String.fromCharCode.apply(null, chunk);
+          }
+          return btoa(binary);
+        }
+
+        const KpubB64 = uint8ToBase64(kyberPk);
+        const FpubB64 = uint8ToBase64(falconPk);
         await fetch("http://localhost:8000/api/publish_kem", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ user: userId, kem_pub: Array.from(kyberPk), falcon_pub: Array.from(falconPk) }),
+          body: JSON.stringify({ user: userId, kem_pub: KpubB64, falcon_pub: FpubB64 }),
         });
 
         console.log("✅ Public keys published to backend");
@@ -32,6 +60,46 @@ export default function ChatPage({ socket, userId }) {
     }
     initKeys();
   }, [userId]);
+
+  useEffect(() => {
+    if (!activePeer) return;
+
+    async function fetchOnlineStatus() {
+      try {
+
+        // If we don't have the key, fetch it first
+        let key = falconPeerKey[activePeer];
+        if (!key) {
+          key = await crypto.getFalconPublicKey(activePeer);
+          setFalconPeerKey((prev) => ({
+            ...prev,
+            [activePeer]: key,
+          }));
+        }
+
+        // Only proceed after key is available
+        if (!key) {
+          console.warn("Public key not found for peer. Cannot verify signature.");
+          return;
+        }
+
+        // Now check online status
+        const res = await fetch(
+          `http://localhost:8000/api/check-online-users/${userId}/${activePeer}`
+        );
+        const data = await res.json();
+
+        setOnlineStatus((prev) => ({
+          ...prev,
+          [activePeer]: data.online,
+        }));
+      } catch (err) {
+        console.error(err);
+      }
+    }
+
+    fetchOnlineStatus();
+  }, [activePeer]);
 
   /** 📩 Handle incoming WebSocket messages */
   useEffect(() => {
@@ -44,12 +112,22 @@ export default function ChatPage({ socket, userId }) {
         setIncomingRequests((prev) => [...prev, data.from]);
       }
 
+      if (data.type === "status_update") {
+        setOnlineStatus((prev) => ({
+          ...prev,
+          [data.peerId]: data.online,
+        }));
+      }
+
       if (data.type === "shared_secret") {
         try {
           const ctUint8 = new Uint8Array(data.ct);
-          await crypto.decapsulate(data.from, ctUint8);
+          await crypto.decapsulate(data.from, ctUint8, data.peerKyberPk);
           setActivePeer(data.from);
-          console.log("✅ Shared secret established with", data.from);
+          setOnlineStatus(prev => ({
+            ...prev,
+            [data.from]: true,
+          }));
         } catch (err) {
           console.error("Failed to decapsulate shared secret:", err);
         }
@@ -57,28 +135,39 @@ export default function ChatPage({ socket, userId }) {
 
       if (data.type === "chat") {
         try {
-          if (!crypto.aesKeys[data.from]) {
-            console.warn("AES key not yet available for", data.from);
-            return;
+          let key = falconPeerKey[activePeer];
+          if (!key) {
+            key = await crypto.getFalconPublicKey(activePeer);
+            setFalconPeerKey((prev) => ({
+              ...prev,
+              [activePeer]: key,
+            }));
           }
 
+          // Only proceed after key is available
+          if (!key) {
+            console.warn("Public key not found for peer. Cannot verify signature.");
+            return;
+          }
+          const ciphertext = new Uint8Array(data.payload.ciphertext);
+          const iv = new Uint8Array(data.payload.iv);
           const decrypted = await crypto.decryptAES(
-            data.payload.ciphertext,
-            data.payload.iv,
+            ciphertext,
+            iv,
             data.from
           );
 
           const sig = new Uint8Array(data.signature);
-          const payload = JSON.stringify(data.payload);
+          
+          // ensure we have the peer's Falcon public key (from cache or DB)
           const isValid = await crypto.verifyMessage(
-            payload,                  // plaintext
-            sig,                        // sig (Uint8Array, not JSON string!)
-            crypto.falconKeys[data.from] // pk stored from handshake
+            JSON.stringify(data.payload), // plaintext
+            sig, // signature (Uint8Array)
+            falconPeerKey[data.from] // peer Falcon public key (Uint8Array)
           );
-
-           if (!isValid) {
+          if (!isValid) {
             console.error("Signature check failed for message from", data.from);
-            return; // don’t trust the message
+            return; // don't trust the message
           }
 
           function toBase64(uint8) {
@@ -103,26 +192,77 @@ export default function ChatPage({ socket, userId }) {
     return () => socket.removeEventListener("message", handler);
   }, [socket, crypto]);
 
+  useEffect(() => {
+    if (isNearBottom()) {
+      console.log("Scrolling to bottom");
+      messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
+    }
+  }, [messages]); 
+
+  const isNearBottom = () => {
+    const el = chatRef.current;
+    if (!el) return true;
+    const threshold = 10; // px
+    return el.scrollHeight - el.scrollTop - el.clientHeight < threshold;
+  };
+
+  function showToast(message) {
+    const toast = document.createElement("div");
+    toast.textContent = message;
+    toast.style.position = "fixed";
+    toast.style.bottom = "20px";
+    toast.style.right = "20px";
+    toast.style.background = "black";
+    toast.style.color = "white";
+    toast.style.padding = "10px 20px";
+    toast.style.borderRadius = "8px";
+    toast.style.opacity = "0.9";
+    toast.style.zIndex = "9999";
+    document.body.appendChild(toast);
+    setTimeout(() => toast.remove(), 2000); // disappears after 2s
+  }
+
   /** 📤 Send chat request */
   const sendChatRequest = async () => {
-    const res1 = await fetch(
-        `http://localhost:8000/api/get_falcon_pub/${peerInput}`
-      );
+    // Ensure we have the peer's Falcon public key persisted locally
+    const existingPk = await crypto.getFalconPublicKey(peerInput);
+    if (!existingPk) {
+      const res1 = await fetch(`http://localhost:8000/api/get_falcon_pub/${peerInput}`);
       const data1 = await res1.json();
       if (!data1.fk) return alert("Peer Falcon public key not found");
 
-      const peerFk = new Uint8Array(data1.fk);
-      crypto.addFalconKey(peerInput, peerFk);
-      console.log("✅ Stored Falcon public key for", peerInput);
+      const peerFk = base64ToUint8(data1.fk);
+      await crypto.addFalconKey(peerInput, peerFk);
+    }
+    const exists = await db.peers
+    .where('[userId+peerId]')
+    .equals([userId, peerInput])
+    .first();
+    if (exists) {
+      setActivePeer(peerInput);
+      return;
+    }
     if (!peerInput) return;
-
     if (!socket || socket.readyState !== WebSocket.OPEN) {
       alert("WebSocket not connected yet!");
       return;
     }
 
     socket.send(JSON.stringify({ type: "chat_request", from: userId, to: peerInput }));
+    showToast(`Chat request sent to ${peerInput}`);
+    setPeerInput("");
   };
+
+  function base64ToUint8(base64) {
+    const binary = atob(base64);
+    const len = binary.length;
+    const bytes = new Uint8Array(len);
+    for (let i = 0; i < len; i++) {
+      bytes[i] = binary.charCodeAt(i);
+    }
+    return bytes;
+  }
+
 
   /** ✅ Accept chat request */
   const acceptChatRequest = async (peerId) => {
@@ -132,8 +272,8 @@ export default function ChatPage({ socket, userId }) {
       );
       const data = await res.json();
       if (!data.pk) return alert("Peer public key not found");
-
-      const peerPk = new Uint8Array(data.pk);
+      
+      const peerPk = base64ToUint8(data.pk);
       const { ct } = await crypto.establishSharedSecret(peerId, peerPk);
 
       const res1 = await fetch(
@@ -142,9 +282,8 @@ export default function ChatPage({ socket, userId }) {
       const data1 = await res1.json();
       if (!data1.fk) return alert("Peer Falcon public key not found");
 
-      const peerFk = new Uint8Array(data1.fk);
+      const peerFk = base64ToUint8(data1.fk);
       crypto.addFalconKey(peerId, peerFk);
-      console.log("✅ Stored Falcon public key for", peerId);
 
       socket.send(
         JSON.stringify({
@@ -152,6 +291,7 @@ export default function ChatPage({ socket, userId }) {
           from: userId,
           to: peerId,
           ct: Array.from(ct),
+          peerKyberPk: peerPk,
         })
       );
 
@@ -162,14 +302,13 @@ export default function ChatPage({ socket, userId }) {
     }
   };
 
-
   /** 💬 Send chat message */
   const handleSend = async () => {
     if (!activePeer || !input.trim()) return;
 
     await crypto.sendMessage(socket, activePeer, input, userId);
 
-    const timestamp = new Date().toLocaleTimeString();
+    const timestamp = new Date();
     setMessages((prev) => ({
       ...prev,
       [activePeer]: [
@@ -244,7 +383,13 @@ export default function ChatPage({ socket, userId }) {
                     return (
                       <button
                         key={chatUserId}
-                        onClick={() => setActivePeer(chatUserId)}
+                        onClick={() => {
+                          setActivePeer(chatUserId);
+                          setOnlineStatus(prev => ({
+                            ...prev,
+                            [chatUserId]: false  // until backend confirms otherwise
+                          }));
+                        }}
                         className={`w-full text-left p-3 rounded-lg transition-all duration-200 group ${
                           isActive 
                             ? 'bg-blue-50 border-2 border-blue-200' 
@@ -374,7 +519,7 @@ export default function ChatPage({ socket, userId }) {
           {/* Chat Area */}
           <div className="lg:col-span-2">
             {activePeer ? (
-              <div className="bg-white rounded-xl shadow-sm border border-slate-200 h-[600px] flex flex-col">
+              <div className="bg-white rounded-xl shadow-sm border border-slate-200 flex flex-col h-screen">
                 {/* Chat Header */}
                 <div className="flex items-center space-x-3 p-4 border-b border-slate-200">
                   <div className="w-10 h-10 bg-gradient-to-r from-blue-500 to-purple-600 rounded-full flex items-center justify-center">
@@ -386,13 +531,13 @@ export default function ChatPage({ socket, userId }) {
                     <h3 className="font-medium text-slate-900">{activePeer}</h3>
                     <div className="text-sm text-green-600 flex items-center">
                       <div className="w-2 h-2 bg-green-500 rounded-full mr-2"></div>
-                      Online • End-to-end encrypted
+                      {onlineStatus[activePeer] ? "Online" : "Offline"} • End-to-end encrypted
                     </div>
                   </div>
                 </div>
 
                 {/* Messages */}
-                <div className="flex-1 overflow-y-auto p-4 space-y-4">
+                <div className="flex-1 overflow-y-auto p-4 pb-[90px] space-y-4">
                 {(messages[activePeer] || []).map((message, i) => (
                   <div
                     key={i}
@@ -418,15 +563,15 @@ export default function ChatPage({ socket, userId }) {
 
                     {/* Timestamp */}
                     <div className="text-[10px] text-slate-400 mt-1">
-                      {message.timestamp}
+                      {message.timestamp.toLocaleString()}
                     </div>
                   </div>
                 ))}
+                <div ref={messagesEndRef} />
               </div>
-              
 
                 {/* Input */}
-                <div className="p-4 border-t border-slate-200">
+                <div className="p-4 border-t border-slate-200 sticky bottom-0 bg-white">
                   <div className="flex space-x-3">
                     <input
                       value={input}

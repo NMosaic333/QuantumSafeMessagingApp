@@ -35,6 +35,7 @@ env.bak/
 venv.bak/
 # Ignore Python virtual environment
 backend/app/venv/
+backend/app/.env
 
 # --- Environment & secrets ---
 .env

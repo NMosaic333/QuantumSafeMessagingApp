@@ -5,6 +5,7 @@ import bcrypt
 import secrets
 from datetime import datetime, timedelta
 from typing import Dict, List
+from dotenv import load_dotenv
 
 from fastapi import FastAPI, Depends, HTTPException, Header, WebSocket, WebSocketDisconnect, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -17,9 +18,8 @@ import uvicorn
 #                   DATABASE CONFIGURATION
 # ============================================================
 
-DATABASE_URL = os.getenv(
-    "DATABASE_URL", "postgresql+psycopg2://postgres:nothingmuch@localhost:5432/ipdaes"
-)
+load_dotenv()  # Load environment variables from .env file
+DATABASE_URL = os.getenv("DATABASE_URL")
 SESSION_EXPIRY_MINUTES = 60  # Session validity in minutes
 
 engine = create_engine(DATABASE_URL, echo=False, future=True)

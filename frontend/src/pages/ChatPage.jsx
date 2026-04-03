@@ -1,10 +1,13 @@
-import React, { useRef,useState, useEffect } from "react";
+import React, { useRef, useState, useEffect } from "react";
 import { MessageCircle, UserPlus, Users, Send, Check, X } from "lucide-react";
 import { useCrypto } from "../utilities/cryptomanager";
 import { db } from "../utilities/db";
 import { falcon } from "falcon-crypto";
 
-export default function ChatPage({ socket, userId }) {
+// Get API URL from environment or use localhost as fallback
+const API_URL = import.meta.env.VITE_API_URL || "http://localhost:8000";
+
+export default function ChatPage({ socket, userId, token }) {
   const crypto = useCrypto();
   const [peerInput, setPeerInput] = useState("");
   const [incomingRequests, setIncomingRequests] = useState([]);
@@ -47,7 +50,7 @@ export default function ChatPage({ socket, userId }) {
 
         const KpubB64 = uint8ToBase64(kyberPk);
         const FpubB64 = uint8ToBase64(falconPk);
-        await fetch("http://localhost:8000/api/publish_kem", {
+        await fetch(`${API_URL}/api/publish_kem`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ user: userId, kem_pub: KpubB64, falcon_pub: FpubB64 }),
@@ -85,7 +88,7 @@ export default function ChatPage({ socket, userId }) {
 
         // Now check online status
         const res = await fetch(
-          `http://localhost:8000/api/check-online-users/${userId}/${activePeer}`
+          `${API_URL}/api/check-online-users/${userId}/${activePeer}`
         );
         const data = await res.json();
 
@@ -227,7 +230,9 @@ export default function ChatPage({ socket, userId }) {
     // Ensure we have the peer's Falcon public key persisted locally
     const existingPk = await crypto.getFalconPublicKey(peerInput);
     if (!existingPk) {
-      const res1 = await fetch(`http://localhost:8000/api/get_falcon_pub/${peerInput}`);
+      const res1 = await fetch(`${API_URL}/api/get_falcon_pub/${peerInput}`, {
+        headers: { "Authorization": `Bearer ${token}` }
+      });
       const data1 = await res1.json();
       if (!data1.fk) return alert("Peer Falcon public key not found");
 
@@ -268,7 +273,8 @@ export default function ChatPage({ socket, userId }) {
   const acceptChatRequest = async (peerId) => {
     try {
       const res = await fetch(
-        `http://localhost:8000/api/get_kyber_pub/${peerId}`
+        `${API_URL}/api/get_kyber_pub/${peerId}`,
+        { headers: { "Authorization": `Bearer ${token}` } }
       );
       const data = await res.json();
       if (!data.pk) return alert("Peer public key not found");
@@ -277,7 +283,8 @@ export default function ChatPage({ socket, userId }) {
       const { ct } = await crypto.establishSharedSecret(peerId, peerPk);
 
       const res1 = await fetch(
-        `http://localhost:8000/api/get_falcon_pub/${peerId}`
+        `${API_URL}/api/get_falcon_pub/${peerId}`,
+        { headers: { "Authorization": `Bearer ${token}` } }
       );
       const data1 = await res1.json();
       if (!data1.fk) return alert("Peer Falcon public key not found");

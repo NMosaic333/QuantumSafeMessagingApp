@@ -2,8 +2,12 @@ import React, { useState, useEffect } from "react";
 import ChatPage from "./pages/ChatPage";
 import { MessageCircle } from "lucide-react";
 
+// Get API URL from environment or use localhost as fallback
+const API_URL = import.meta.env.VITE_API_URL || "http://localhost:8000";
+
 function App() {
   const [userId, setUserId] = useState("");
+  const [token, setToken] = useState("");
   const [password, setPassword] = useState("");
   const [socket, setSocket] = useState(null);
   const [inputValue, setInputValue] = useState("");
@@ -16,7 +20,7 @@ function App() {
 
     try {
       const endpoint = isRegistering ? "register" : "login";
-      const response = await fetch(`http://127.0.0.1:8000/${endpoint}`, {
+      const response = await fetch(`${API_URL}/${endpoint}`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ username: inputValue.trim(), password }),
@@ -32,24 +36,28 @@ function App() {
       const data = await response.json();
 
       setUserId(inputValue.trim());
+      setToken(data.token); // Store the token from login response
     } catch (error) {
       console.error("❌ Error during auth:", error);
-      alert("Network error. Check if backend is running on port 8000.");
+      alert("Network error. Check if backend is running on " + API_URL);
     } finally {
       setLoading(false);
     }
   };
 
-  // connect websocket when userId is set
+  // connect websocket when userId and token are set
   useEffect(() => {
-    if (userId) {
-      const newSocket = new WebSocket(`ws://localhost:8000/ws/${userId}`);
+    if (userId && token) {
+      const wsProtocol = API_URL.startsWith("https") ? "wss" : "ws";
+      const wsUrl = API_URL.replace(/^https?/, wsProtocol);
+      const newSocket = new WebSocket(`${wsUrl}/ws/${userId}?token=${token}`);
       newSocket.onopen = () => console.log("✅ WebSocket connected as", userId);
       newSocket.onclose = () => console.log("❌ WebSocket disconnected");
+      newSocket.onerror = (error) => console.error("WebSocket error:", error);
       setSocket(newSocket);
       return () => newSocket.close();
     }
-  }, [userId]);
+  }, [userId, token]);
 
   if (!userId) {
     return (
@@ -122,7 +130,7 @@ function App() {
     );
   }
 
-  return <ChatPage socket={socket} userId={userId} />;
+  return <ChatPage socket={socket} userId={userId} token={token} />;
 }
 
 export default App;

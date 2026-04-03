@@ -7,12 +7,15 @@ from datetime import datetime, timedelta
 from typing import Dict, List
 from dotenv import load_dotenv
 
-from fastapi import FastAPI, Depends, HTTPException, Header, WebSocket, WebSocketDisconnect, Request
+from fastapi import FastAPI, Depends, HTTPException, Header, WebSocket, WebSocketDisconnect, Request, Query
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from sqlalchemy import Column, String, DateTime, Text, create_engine, ForeignKey
 from sqlalchemy.orm import sessionmaker, declarative_base, relationship, Session
 import uvicorn
+from slowapi import Limiter
+from slowapi.util import get_remote_address
+import re
 
 # ============================================================
 #                   DATABASE CONFIGURATION
@@ -20,7 +23,13 @@ import uvicorn
 
 load_dotenv()  # Load environment variables from .env file
 DATABASE_URL = os.getenv("DATABASE_URL")
+if not DATABASE_URL:
+    raise ValueError("DATABASE_URL environment variable not set")
 SESSION_EXPIRY_MINUTES = 60  # Session validity in minutes
+PENDING_MESSAGE_EXPIRY_MINUTES = 24 * 60  # Auto-delete offline messages after 24 hours
+MAX_REQUEST_SIZE = 100_000  # 100KB max request payload
+CORS_ORIGINS = os.getenv("CORS_ORIGINS", "http://localhost:5173,http://localhost:3000").split(",")
+ALLOWED_USERNAME_PATTERN = re.compile(r"^[a-zA-Z0-9_]{3,50}$")
 
 engine = create_engine(DATABASE_URL, echo=False, future=True)
 SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False)
@@ -34,6 +43,22 @@ def get_db():
     finally:
         db.close()
 
+def verify_token(authorization: str = Header(None), db: Session = Depends(get_db)) -> str:
+    """Verify auth token from Authorization header. Returns username if valid."""
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(401, "Missing or invalid authorization header")
+    
+    token = authorization.replace("Bearer ", "")
+    session = db.query(SessionToken).filter(
+        (SessionToken.token == token) &
+        (SessionToken.expires_at > datetime.utcnow())
+    ).first()
+    
+    if not session:
+        raise HTTPException(401, "Invalid or expired token")
+    
+    return session.username
+
 # ============================================================
 #                   HELPER FUNCTIONS
 # ============================================================
@@ -43,6 +68,12 @@ def hash_password(password: str) -> str:
 
 def verify_password(password: str, hashed: str) -> bool:
     return bcrypt.checkpw(password.encode(), hashed.encode())
+
+def cleanup_expired_messages(db: Session):
+    """Delete pending messages older than PENDING_MESSAGE_EXPIRY_MINUTES"""
+    expiry_time = datetime.utcnow() - timedelta(minutes=PENDING_MESSAGE_EXPIRY_MINUTES)
+    db.query(PendingMessage).filter(PendingMessage.created_at < expiry_time).delete()
+    db.commit()
 
 # ============================================================
 #                   DATABASE MODELS
@@ -100,16 +131,16 @@ Base.metadata.create_all(bind=engine)
 # ============================================================
 
 class UserCreate(BaseModel):
-    username: str
-    password: str
+    username: str = Field(..., min_length=3, max_length=50, regex="^[a-zA-Z0-9_]+$")
+    password: str = Field(..., min_length=8, max_length=128)
 
 class Login(BaseModel):
-    username: str
-    password: str
+    username: str = Field(..., min_length=3, max_length=50)
+    password: str = Field(..., min_length=8, max_length=128)
 
 class MessageCreate(BaseModel):
-    recipient_username: str
-    body: str
+    recipient_username: str = Field(..., min_length=3, max_length=50)
+    body: str = Field(..., min_length=1, max_length=10000)
 
 # ============================================================
 #                   FASTAPI SETUP
@@ -117,12 +148,17 @@ class MessageCreate(BaseModel):
 
 app = FastAPI(title="IPDAES + WebSocket Signaling")
 
+# Rate limiting
+limiter = Limiter(key_func=get_remote_address)
+app.state.limiter = limiter
+
+# CORS configuration - restrict to specific origins
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=CORS_ORIGINS,
     allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_methods=["POST", "GET"],
+    allow_headers=["Content-Type", "Authorization"],
 )
 
 # ============================================================
@@ -137,7 +173,8 @@ peer_map: Dict[str, List[str]] = {}
 # ============================================================
 
 @app.post("/register")
-def register(user: UserCreate, db: Session = Depends(get_db)):
+@limiter.limit("5/minute")
+async def register(request: Request, user: UserCreate, db: Session = Depends(get_db)):
     if db.query(User).filter(User.username == user.username).first():
         raise HTTPException(400, "username already exists")
     new_user = User(username=user.username, password_hash=hash_password(user.password))
@@ -147,7 +184,8 @@ def register(user: UserCreate, db: Session = Depends(get_db)):
 
 
 @app.post("/login")
-def login(data: Login, db: Session = Depends(get_db)):
+@limiter.limit("5/minute")
+async def login(request: Request, data: Login, db: Session = Depends(get_db)):
     user = db.query(User).filter(User.username == data.username).first()
     if not user or not verify_password(data.password, user.password_hash):
         raise HTTPException(401, "Invalid credentials")
@@ -155,7 +193,7 @@ def login(data: Login, db: Session = Depends(get_db)):
     expires_at = datetime.utcnow() + timedelta(minutes=SESSION_EXPIRY_MINUTES)
     db.add(SessionToken(token=token, username=user.username, expires_at=expires_at))
     db.commit()
-    return {"token": token, "expires_at": expires_at}
+    return {"token": token, "username": user.username, "expires_at": expires_at.isoformat()}
 
 
 def get_user_by_token(token: str = Header(...), db: Session = Depends(get_db)) -> User:
@@ -228,15 +266,34 @@ async def broadcast_status(user_id: str, online: bool):
 
 
 @app.websocket("/ws/{user_id}")
-async def websocket_endpoint(websocket: WebSocket, user_id: str):
+async def websocket_endpoint(websocket: WebSocket, user_id: str, token: str = Query(...)):
+    """WebSocket endpoint with token-based authentication"""
+    # Verify token before accepting connection
+    db = SessionLocal()
+    try:
+        session = db.query(SessionToken).filter(
+            (SessionToken.token == token) & 
+            (SessionToken.username == user_id) &
+            (SessionToken.expires_at > datetime.utcnow())
+        ).first()
+        if not session:
+            await websocket.close(code=1008, reason="Unauthorized")
+            return
+    finally:
+        db.close()
+    
     await websocket.accept()
     connected_users[user_id] = websocket
     print(f"{user_id} connected.")
     await broadcast_status(user_id, True)
 
     db = None
+    authenticated_user = user_id  # Store authenticated user from token
     try:
         db = SessionLocal()
+        
+        # Clean up expired pending messages
+        cleanup_expired_messages(db)
 
         # ========================================
         # 1️⃣ Send pending chat requests
@@ -293,7 +350,12 @@ async def websocket_endpoint(websocket: WebSocket, user_id: str):
             msg = json.loads(data)
             msg_type = msg.get("type")
             recipient = msg.get("to")
-            user_id = msg.get("from")
+            claimed_sender = msg.get("from")
+
+            # Verify sender is claiming to be the authenticated user (prevent spoofing)
+            if claimed_sender != authenticated_user:
+                print(f"Message spoofing attempt: {claimed_sender} != {authenticated_user}")
+                continue
 
             if msg_type in ["chat_request", "shared_secret", "chat"]:
                 if recipient in connected_users:
@@ -301,11 +363,11 @@ async def websocket_endpoint(websocket: WebSocket, user_id: str):
                 else:
                     # offline → store as pending
                     if msg_type == "chat_request":
-                        db.add(PendingRequest(user_id=user_id, peer_id=recipient))
+                        db.add(PendingRequest(user_id=authenticated_user, peer_id=recipient))
                     else:
                         offline_msg = PendingMessage(
                             receiver_id=recipient,
-                            sender_id=user_id,
+                            sender_id=authenticated_user,
                             payload=json.dumps(msg.get("payload", "")),
                             signature=msg.get("signature", "")
                         )
@@ -315,12 +377,15 @@ async def websocket_endpoint(websocket: WebSocket, user_id: str):
                 print(f"Unknown message type: {msg_type}")
 
     except WebSocketDisconnect:
-        print(f"{user_id} disconnected.")
-        connected_users.pop(user_id, None)
-        await broadcast_status(user_id, False)
+        print(f"{authenticated_user} disconnected.")
+        connected_users.pop(authenticated_user, None)
+        await broadcast_status(authenticated_user, False)
+        # Clean up peer map to prevent memory leak
+        if authenticated_user in peer_map:
+            del peer_map[authenticated_user]
         for peers in peer_map.values():
-            if user_id in peers:
-                peers.remove(user_id)
+            if authenticated_user in peers:
+                peers.remove(authenticated_user)
     except Exception as e:
         print(f"WebSocket error for {user_id}: {e}")
     finally:
@@ -333,6 +398,11 @@ async def websocket_endpoint(websocket: WebSocket, user_id: str):
 
 @app.post("/api/publish_kem")
 async def publish_kem(request: Request, db: Session = Depends(get_db)):
+    # Check request size
+    content_length = request.headers.get("content-length")
+    if content_length and int(content_length) > MAX_REQUEST_SIZE:
+        raise HTTPException(413, f"Payload too large. Max size: {MAX_REQUEST_SIZE} bytes")
+    
     data = await request.json()
     user = data.get("user")
     kem_pub = data.get("kem_pub")
@@ -354,7 +424,8 @@ async def publish_kem(request: Request, db: Session = Depends(get_db)):
 
 
 @app.get("/api/get_kyber_pub/{user_id}")
-async def get_kyber_pub(user_id: str, db: Session = Depends(get_db)):
+async def get_kyber_pub(user_id: str, authenticated_username: str = Depends(verify_token), db: Session = Depends(get_db)):
+    """Get Kyber public key for a user. Requires authentication to prevent user enumeration."""
     db_user = db.query(User).filter(User.username == user_id).first()
     if not db_user:
         raise HTTPException(status_code=404, detail="User not found")
@@ -362,7 +433,8 @@ async def get_kyber_pub(user_id: str, db: Session = Depends(get_db)):
 
 
 @app.get("/api/get_falcon_pub/{user_id}")
-async def get_falcon_pub(user_id: str, db: Session = Depends(get_db)):
+async def get_falcon_pub(user_id: str, authenticated_username: str = Depends(verify_token), db: Session = Depends(get_db)):
+    """Get Falcon public key for a user. Requires authentication to prevent user enumeration."""
     db_user = db.query(User).filter(User.username == user_id).first()
     if not db_user:
         raise HTTPException(status_code=404, detail="User not found")
